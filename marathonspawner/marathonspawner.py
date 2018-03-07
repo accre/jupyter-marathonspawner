@@ -275,6 +275,7 @@ class MarathonSpawner(Spawner):
             instances=1
             )
 
+        self.log.info("Creating App: %s", app_request)
         app = self.marathon.create_app(self.container_name, app_request)
         if app is False or app.deployments is None:
             self.log.error("Failed to create application for %s", self.container_name)
