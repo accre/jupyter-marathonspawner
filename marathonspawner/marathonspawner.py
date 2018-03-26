@@ -283,7 +283,6 @@ class MarathonSpawner(Spawner):
         if app is False or app.deployments is None:
             self.log.error("Failed to create application for %s", self.container_name)
             self.log.error("app: %s", app)
-            self.log.error("app.deployments: %s", app.deployments)
             return None
 
         while True:
