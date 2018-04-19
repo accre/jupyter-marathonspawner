@@ -272,7 +272,8 @@ class MarathonSpawner(Spawner):
             container=app_container,
             constraints=self.get_constraints(),
             health_checks=self.get_health_checks(),
-            instances=1
+            instances=1,
+            accepted_resource_roles=['*']
             )
 
         self.log.info("Creating App: %s", app_request)
