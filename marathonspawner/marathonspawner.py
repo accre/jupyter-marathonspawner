@@ -7,14 +7,14 @@ import warnings
 from textwrap import dedent
 from tornado import gen
 from tornado.concurrent import run_on_executor
-from traitlets import Any, Integer, List, Unicode, default, observe
+from traitlets import Any, Integer, List, Unicode, Bool, default, observe
 
 from marathon import MarathonClient
 from marathon.models.app import MarathonApp, MarathonHealthCheck
 from marathon.models.container import MarathonContainerPortMapping, \
     MarathonContainer, MarathonContainerVolume, MarathonDockerContainer
 from marathon.models.constraint import MarathonConstraint
-from marathon.exceptions import NotFoundError
+from marathon.exceptions import NotFoundError, MarathonHttpError
 from jupyterhub.spawner import Spawner
 
 from .volumenaming import default_format_volume_name
@@ -79,6 +79,12 @@ class MarathonSpawner(Spawner):
         help="Public IP address of the hub"
         ).tag(config=True)
 
+    force_pull_image = Bool(
+        False,
+        config=True,
+        help="Tell marathon to pull the image on every spawn",
+    )
+
     @observe('hub_ip_connect')
     def _ip_connect_changed(self, change):
         if jupyterhub.version_info >= (0, 8):
@@ -136,16 +142,24 @@ class MarathonSpawner(Spawner):
 
     @property
     def container_name(self):
-        return '/%s/%s' % (self.app_prefix, self.user.name)
+        username_sanitized = self.user.name.replace('.','-')
+        return '/%s/%s' % (self.app_prefix, username_sanitized)
 
     def get_state(self):
         state = super(MarathonSpawner, self).get_state()
         state['container_name'] = self.container_name
+        if getattr(self, 'limits_name', None):
+            state['limits_name'] = self.limits_name
+        self.log.info("writing state %s", state)
         return state
 
     def load_state(self, state):
-        if 'container_name' in state:
-            pass
+        super(MarathonSpawner, self).load_state(state)
+        self.log.info("loaded state %s", state)
+        #if 'container_name' in state:
+        #    self.container_name = state['container_name']
+        if 'limits_name' in state:
+            self.limits_name = state['limits_name']
 
     def get_health_checks(self):
         health_checks = []
@@ -207,15 +221,19 @@ class MarathonSpawner(Spawner):
     def get_ip_and_port(self, app_info):
         assert len(app_info.tasks) == 1
         ip = socket.gethostbyname(app_info.tasks[0].host)
+        self.log.info("Found app at %s:%s (%s)", ip, app_info.tasks[0].ports[0], app_info.tasks[0].host)
         return (ip, app_info.tasks[0].ports[0])
 
     @run_on_executor
     def get_app_info(self, app_name):
         try:
             app = self.marathon.get_app(app_name, embed_tasks=True)
-        except NotFoundError:
-            self.log.info("The %s application has not been started yet", app_name)
+        except NotFoundError as e:
+            self.log.info("The %s application does not exist", app_name)
             return None
+        except Exception as e:
+            self.log.error("Got exception at get_app_info!")
+            raise e
         else:
             return app
 
@@ -245,10 +263,21 @@ class MarathonSpawner(Spawner):
         return args
 
     @gen.coroutine
-    def start(self):
+    def start(self, app_image = None, resource_ram = None, resource_cpu = None, resource_name = None):
+        self.log.info("resource_namex: %s" % resource_name)
+        if not app_image:
+            app_image = self.app_image
+        if resource_ram:
+            self.mem_limit = resource_ram
+        if resource_cpu:
+            self.cpu_limit = resource_cpu
+        if resource_name:
+            self.limits_name = resource_name
+
         docker_container = MarathonDockerContainer(
-            image=self.app_image,
+            image=app_image,
             network=self.network_mode,
+            force_pull_image=self.force_pull_image,
             port_mappings=self.get_port_mappings())
 
         app_container = MarathonContainer(
@@ -257,15 +286,14 @@ class MarathonSpawner(Spawner):
             volumes=self.get_volumes())
 
         # the memory request in marathon is in MiB
-        if hasattr(self, 'mem_limit') and self.mem_limit is not None:
+        if hasattr(self, 'mem_limit') and resource_ram is not None:
             mem_request = self.mem_limit / 1024.0 / 1024.0
         else:
             mem_request = 1024.0
 
-        cmd = self.cmd + self.get_args()
         app_request = MarathonApp(
             id=self.container_name,
-            cmd=' '.join(cmd),
+            args = self.cmd + self.get_args(),
             env=self.get_env(),
             cpus=self.cpu_limit,
             mem=mem_request,
@@ -273,16 +301,23 @@ class MarathonSpawner(Spawner):
             constraints=self.get_constraints(),
             health_checks=self.get_health_checks(),
             instances=1,
-            accepted_resource_roles=['*']
+            accepted_resource_roles=['*'],
             )
 
         self.log.info("Creating App: %s", app_request)
         self.log.info("self.marathon: %s", self.marathon)
-        app = self.marathon.create_app(self.container_name, app_request)
-        if app is False or app.deployments is None:
-            self.log.error("Failed to create application for %s", self.container_name)
-            self.log.error("app: %s", app)
-            return None
+        try:
+            app = self.marathon.create_app(self.container_name, app_request)
+            if app is False or app.deployments is None:
+                self.log.error("Failed to create application for %s", self.container_name)
+                self.log.error("app: %s", app)
+                return None
+        except MarathonHttpError as ex:
+            if ex.error_message.startswith("An app with id") and \
+                    ex.error_message.endswith(" already exists."):
+                self.log.info("Attempting to recover %s", self.container_name)
+            else:
+                raise
 
         while True:
             app_info = yield self.get_app_info(self.container_name)
@@ -290,12 +325,15 @@ class MarathonSpawner(Spawner):
                 ip, port = self.get_ip_and_port(app_info)
                 break
             yield gen.sleep(1)
-        return (ip, port)
+        self.log.info("Start completed - %s:%s" % (ip, port))
+        nb_url = "http://%s:%s" % (ip, port)
+        return nb_url
 
     @gen.coroutine
     def stop(self, now=False):
+        app_info = yield self.get_app_info(self.container_name)
         try:
-            status = self.marathon.delete_app(self.container_name)
+            status = self.marathon.delete_app(self.container_name, force=True)
         except:
             self.log.error("Could not delete application %s", self.container_name)
             raise
@@ -309,15 +347,20 @@ class MarathonSpawner(Spawner):
 
     @gen.coroutine
     def poll(self):
-        deployment = yield self.get_deployment_for_app(self.container_name)
-        if deployment:
-            for current_action in deployment.current_actions:
-                if current_action.action == 'StopApplication':
-                    self.log.error("Application %s is shutting down", self.container_name)
-                    return 1
-            return None
+        try:
+            deployment = yield self.get_deployment_for_app(self.container_name)
+            if deployment:
+                for current_action in deployment.current_actions:
+                    if current_action.action == 'StopApplication':
+                        self.log.error("Application %s is shutting down", self.container_name)
+                        return 1
+                return None
 
-        app_info = yield self.get_app_info(self.container_name)
-        if app_info and app_info.tasks_healthy == 1:
+            app_info = yield self.get_app_info(self.container_name)
+            if app_info and app_info.tasks_healthy == 1:
+                return None
+            return 0
+        except MarathonHttpError as e:
+            self.log.error("Marathon unreachable in poll(), just saying things are OK")
+            self.log.error("Nested exception was: %s" % e)
             return None
-        return 0
